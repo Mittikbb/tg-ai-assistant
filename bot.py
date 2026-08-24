@@ -5,19 +5,20 @@ import os
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiohttp import web
+from google import genai
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
-# Переменные окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+MY_TELEGRAM_ID = os.getenv("MY_TELEGRAM_ID")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PORT = int(os.getenv("PORT", 8080))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ---
 def init_db():
     conn = sqlite3.connect("bot_data.db")
     cursor = conn.cursor()
@@ -27,6 +28,8 @@ def init_db():
             username TEXT
         )
     """)
+    if MY_TELEGRAM_ID and MY_TELEGRAM_ID.isdigit():
+        cursor.execute("INSERT OR REPLACE INTO whitelist (user_id, username) VALUES (?, ?)", (int(MY_TELEGRAM_ID), "Admin"))
     conn.commit()
     conn.close()
 
@@ -62,11 +65,10 @@ def get_whitelist():
     conn.close()
     return rows
 
-# --- ЛОГИКА ТЕЛЕГРАМ-БОТА ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if is_whitelisted(message.from_user.id):
-        await message.answer("Привет! У тебя есть доступ к боту.")
+        await message.answer("Привет! У тебя есть доступ к нейросети. Задай вопрос!")
     else:
         await message.answer(f"Доступ запрещен. Твой ID: `{message.from_user.id}`", parse_mode="Markdown")
 
@@ -75,9 +77,22 @@ async def handle_all_messages(message: types.Message):
     if not is_whitelisted(message.from_user.id):
         await message.answer("У вас нет доступа к боту.")
         return
-    await message.answer("Сообщение получено!")
 
-# --- ВЕБ-ПАНЕЛЬ АДМИНИСТРАТОРА (AIOHTTP) ---
+    if not ai_client:
+        await message.answer("Ошибка: GEMINI_API_KEY не задан.")
+        return
+
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    try:
+        response = ai_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=message.text,
+        )
+        await message.answer(response.text)
+    except Exception as e:
+        logging.error(f"AI Error: {e}")
+        await message.answer("Ошибка при обработке запроса нейросетью.")
+
 def get_login_html(error=""):
     error_block = f"<div class='error'>{error}</div>" if error else ""
     return f"""
@@ -129,7 +144,6 @@ def get_dashboard_html(users_rows):
 </head>
 <body>
     <h1>Панель управления Белым Списком</h1>
-    
     <div class="card">
         <h3>Добавить пользователя</h3>
         <form method="POST" action="/add">
@@ -138,7 +152,6 @@ def get_dashboard_html(users_rows):
             <button type="submit">Добавить</button>
         </form>
     </div>
-
     <div class="card">
         <h3>Разрешенные пользователи</h3>
         <table>
@@ -207,7 +220,6 @@ async def handle_delete(request):
         remove_from_whitelist(int(u_id))
     return web.HTTPFound('/')
 
-# --- ЗАПУСК ---
 async def main():
     app = web.Application()
     app.router.add_get('/', handle_root)
