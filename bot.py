@@ -76,7 +76,7 @@ user_sessions = {}
 
 def get_user_chat(user_id: int):
     if user_id not in user_sessions and ai_client:
-        user_sessions[user_id] = ai_client.chats.create(model="gemini-2.5-flash")
+        user_sessions[user_id] = ai_client.chats.create(model="gemini-3.6-flash")
     return user_sessions.get(user_id)
 
 # --- Клавиатуры ---
