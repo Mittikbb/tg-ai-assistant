@@ -27,7 +27,7 @@ dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Создаем чат с историей (памятью) для Gemini
-ai_chat = ai_client.chats.create(model="gemini-2.5-flash")
+ai_chat = ai_client.chats.create(model="gemini-1.5-flash")
 
 # Глобальный статус (по умолчанию - Обычный)
 USER_STATUS = "default"
