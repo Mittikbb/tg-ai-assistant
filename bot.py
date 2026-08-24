@@ -2,25 +2,31 @@ import asyncio
 import logging
 import sqlite3
 import os
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.enums import ChatAction
 from aiogram.filters import Command
+from aiogram.types import BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
 from google import genai
 
 logging.basicConfig(level=logging.INFO)
 
+# --- Конфигурация ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-MY_TELEGRAM_ID = os.getenv("MY_TELEGRAM_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+ADMIN_ID = int(os.getenv("MY_TELEGRAM_ID", 0))
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 PORT = int(os.getenv("PORT", 8080))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
+# --- База Данных ---
+DB_NAME = "bot_data.db"
+
 def init_db():
-    conn = sqlite3.connect("bot_data.db")
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS whitelist (
@@ -28,75 +34,182 @@ def init_db():
             username TEXT
         )
     """)
-    if MY_TELEGRAM_ID and MY_TELEGRAM_ID.isdigit():
-        cursor.execute("INSERT OR REPLACE INTO whitelist (user_id, username) VALUES (?, ?)", (int(MY_TELEGRAM_ID), "Admin"))
+    if ADMIN_ID != 0:
+        cursor.execute("INSERT OR REPLACE INTO whitelist (user_id, username) VALUES (?, ?)", (ADMIN_ID, "Admin"))
     conn.commit()
     conn.close()
 
-init_db()
-
-def is_whitelisted(user_id):
-    conn = sqlite3.connect("bot_data.db")
+def get_allowed_users() -> set:
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM whitelist WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
+    cursor.execute("SELECT user_id FROM whitelist")
+    users = {row[0] for row in cursor.fetchall()}
     conn.close()
-    return row is not None
+    return users
 
-def add_to_whitelist(user_id, username=""):
-    conn = sqlite3.connect("bot_data.db")
+def add_to_whitelist(user_id: int, username: str = ""):
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("INSERT OR REPLACE INTO whitelist (user_id, username) VALUES (?, ?)", (user_id, username))
     conn.commit()
     conn.close()
 
-def remove_from_whitelist(user_id):
-    conn = sqlite3.connect("bot_data.db")
+def remove_from_whitelist(user_id: int):
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM whitelist WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
 
-def get_whitelist():
-    conn = sqlite3.connect("bot_data.db")
+def get_whitelist_with_names():
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT user_id, username FROM whitelist")
     rows = cursor.fetchall()
     conn.close()
     return rows
 
+init_db()
+
+# --- Сессии ИИ ---
+user_sessions = {}
+
+def get_user_chat(user_id: int):
+    if user_id not in user_sessions and ai_client:
+        user_sessions[user_id] = ai_client.chats.create(model="gemini-2.5-flash")
+    return user_sessions.get(user_id)
+
+# --- Клавиатуры ---
+def get_main_keyboard(is_admin: bool):
+    buttons = [
+        [InlineKeyboardButton(text="🔄 Сбросить диалог", callback_data="reset_chat")]
+    ]
+    if is_admin:
+        buttons.append([InlineKeyboardButton(text="📋 Белый список", callback_data="show_whitelist")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+async def set_bot_commands(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="Главное меню и статус"),
+        BotCommand(command="reset", description="Сбросить контекст диалога"),
+        BotCommand(command="allow", description="[Admin] Добавить ID"),
+        BotCommand(command="deny", description="[Admin] Удалить ID"),
+        BotCommand(command="whitelist", description="[Admin] Список ID"),
+    ]
+    await bot.set_my_commands(commands)
+
+# --- Команды Telegram-бота ---
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    if is_whitelisted(message.from_user.id):
-        await message.answer("Привет! У тебя есть доступ к нейросети. Задай вопрос!")
-    else:
-        await message.answer(f"Доступ запрещен. Твой ID: `{message.from_user.id}`", parse_mode="Markdown")
-
-@dp.message()
-async def handle_all_messages(message: types.Message):
-    if not is_whitelisted(message.from_user.id):
-        await message.answer("У вас нет доступа к боту.")
+async def start_cmd(message: types.Message):
+    user_id = message.from_user.id
+    allowed = get_allowed_users()
+    
+    if user_id not in allowed:
+        await message.answer("⛔ У вас нет доступа к этому боту.")
         return
 
-    if not ai_client:
-        await message.answer("Ошибка: GEMINI_API_KEY не задан.")
+    is_admin = (user_id == ADMIN_ID)
+    text = "👋 **Привет! Я твой ИИ-ассистент.**\n\nОтправь мне любое сообщение, и я отвечу!"
+    await message.answer(text, reply_markup=get_main_keyboard(is_admin), parse_mode="Markdown")
+
+@dp.message(Command("reset"))
+async def reset_cmd(message: types.Message):
+    user_id = message.from_user.id
+    user_sessions.pop(user_id, None)
+    await message.answer("🔄 Контекст вашего диалога сброшен!")
+
+@dp.message(Command("allow"))
+async def allow_cmd(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    args = message.text.split()
+    if len(args) < 2 or not args[1].isdigit():
+        await message.answer("Использование: `/allow <telegram_id>`", parse_mode="Markdown")
         return
 
-    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    target_id = int(args[1])
+    add_to_whitelist(target_id)
+    await message.answer(f"✅ Пользователь `{target_id}` сохранен в базу данных и добавлен в белый список.", parse_mode="Markdown")
+
+@dp.message(Command("deny"))
+async def deny_cmd(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    args = message.text.split()
+    if len(args) < 2 or not args[1].isdigit():
+        await message.answer("Использование: `/deny <telegram_id>`", parse_mode="Markdown")
+        return
+
+    target_id = int(args[1])
+    if target_id == ADMIN_ID:
+        await message.answer("❌ Нельзя удалить себя из белого списка!")
+        return
+
+    remove_from_whitelist(target_id)
+    user_sessions.pop(target_id, None)
+    await message.answer(f"🚫 Пользователь `{target_id}` удален из базы данных и белого списка.", parse_mode="Markdown")
+
+@dp.message(Command("whitelist"))
+async def whitelist_cmd(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    users = get_allowed_users()
+    users_list = "\n".join([f"• `{uid}`" for uid in users])
+    await message.answer(f"📋 **Белый список (из БД):**\n{users_list}", parse_mode="Markdown")
+
+# --- Callbacks ---
+@dp.callback_query(F.data == "reset_chat")
+async def cb_reset(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user_sessions.pop(user_id, None)
+    await callback.answer("Контекст очищен!")
+    await callback.message.answer("🔄 Контекст общения сброшен.")
+
+@dp.callback_query(F.data == "show_whitelist")
+async def cb_whitelist(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Доступ запрещен", show_alert=True)
+        return
+    
+    users = get_allowed_users()
+    users_list = "\n".join([f"• `{uid}`" for uid in users])
+    await callback.answer()
+    await callback.message.answer(f"📋 **Белый список (из БД):**\n{users_list}", parse_mode="Markdown")
+
+# --- Сообщения ---
+@dp.message(F.text)
+async def handle_message(message: types.Message):
+    user_id = message.from_user.id
+    allowed = get_allowed_users()
+    
+    if user_id not in allowed:
+        await message.answer("⛔ У вас нет доступа к этому боту.")
+        return
+
+    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+
     try:
-        response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=message.text,
-        )
-        await message.answer(response.text)
-    except Exception as e:
-        logging.error(f"AI Error: {e}")
-        await message.answer("Ошибка при обработке запроса нейросетью.")
+        user_chat = get_user_chat(user_id)
+        if not user_chat:
+            await message.answer("⚠️ Ошибка: GEMINI_API_KEY не задан.")
+            return
 
+        response = user_chat.send_message(message.text)
+        try:
+            await message.answer(response.text, parse_mode="Markdown")
+        except Exception:
+            await message.answer(response.text)
+            
+    except Exception as e:
+        await message.answer(f"⚠️ Ошибка при запросе к ИИ: {e}")
+
+# --- ВЕБ-АДМИНКА (aiohttp) ---
 def get_login_html(error=""):
     error_block = f"<div class='error'>{error}</div>" if error else ""
-    return f"""
-<!DOCTYPE html>
+    return f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -120,12 +233,10 @@ def get_login_html(error=""):
         {error_block}
     </div>
 </body>
-</html>
-"""
+</html>"""
 
 def get_dashboard_html(users_rows):
-    return f"""
-<!DOCTYPE html>
+    return f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -164,13 +275,11 @@ def get_dashboard_html(users_rows):
         </table>
     </div>
 </body>
-</html>
-"""
+</html>"""
 
 async def handle_root(request):
-    cookies = request.cookies
-    if cookies.get("auth") == "true":
-        users = get_whitelist()
+    if request.cookies.get("auth") == "true":
+        users = get_whitelist_with_names()
         rows = ""
         for u_id, u_name in users:
             rows += f"""
@@ -183,12 +292,10 @@ async def handle_root(request):
                         <button type="submit" class="del">Удалить</button>
                     </form>
                 </td>
-            </tr>
-            """
+            </tr>"""
         if not rows:
             rows = "<tr><td colspan='3'>Список пуст</td></tr>"
         return web.Response(text=get_dashboard_html(rows), content_type="text/html")
-    
     return web.Response(text=get_login_html(), content_type="text/html")
 
 async def handle_login(request):
@@ -200,8 +307,7 @@ async def handle_login(request):
     return web.Response(text=get_login_html("Неверный пароль"), content_type="text/html")
 
 async def handle_add(request):
-    cookies = request.cookies
-    if cookies.get("auth") != "true":
+    if request.cookies.get("auth") != "true":
         return web.HTTPFound('/')
     data = await request.post()
     u_id = data.get("user_id")
@@ -211,15 +317,16 @@ async def handle_add(request):
     return web.HTTPFound('/')
 
 async def handle_delete(request):
-    cookies = request.cookies
-    if cookies.get("auth") != "true":
+    if request.cookies.get("auth") != "true":
         return web.HTTPFound('/')
     data = await request.post()
     u_id = data.get("user_id")
     if u_id and u_id.isdigit():
         remove_from_whitelist(int(u_id))
+        user_sessions.pop(int(u_id), None)
     return web.HTTPFound('/')
 
+# --- Запуск приложения ---
 async def main():
     app = web.Application()
     app.router.add_get('/', handle_root)
@@ -234,6 +341,7 @@ async def main():
     logging.info(f"Запуск веб-сервера на порту {PORT}...")
     await site.start()
     
+    await set_bot_commands(bot)
     logging.info("Запуск Telegram-бота...")
     await dp.start_polling(bot)
 
