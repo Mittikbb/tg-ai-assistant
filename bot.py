@@ -9,8 +9,8 @@ from aiohttp import web
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
-# Переменные окружения (с дефолтными значениями для проверки)
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ТВОЙ_ТОКЕН_БОТА")
+# Переменные окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 PORT = int(os.getenv("PORT", 8080))
 
@@ -78,19 +78,21 @@ async def handle_all_messages(message: types.Message):
     await message.answer("Сообщение получено!")
 
 # --- ВЕБ-ПАНЕЛЬ АДМИНИСТРАТОРА (AIOHTTP) ---
-HTML_LOGIN = """
+def get_login_html(error=""):
+    error_block = f"<div class='error'>{error}</div>" if error else ""
+    return f"""
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <title>Вход в панель</title>
     <style>
-        body { font-family: sans-serif; background: #1a1a1a; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .card { background: #2a2a2a; padding: 30px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); width: 300px; }
-        input[type="password"] { width: 100%; padding: 10px; margin: 10px 0; border-radius: 4px; border: 1px solid #444; background: #333; color: #fff; box-sizing: border-box; }
-        button { width: 100%; padding: 10px; background: #28a745; border: none; color: #fff; border-radius: 4px; cursor: pointer; font-size: 16px; }
-        button:hover { background: #218838; }
-        .error { color: #ff6b6b; margin-top: 10px; text-align: center; }
+        body {{ font-family: sans-serif; background: #1a1a1a; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
+        .card {{ background: #2a2a2a; padding: 30px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); width: 300px; }}
+        input[type="password"] {{ width: 100%; padding: 10px; margin: 10px 0; border-radius: 4px; border: 1px solid #444; background: #333; color: #fff; box-sizing: border-box; }}
+        button {{ width: 100%; padding: 10px; background: #28a745; border: none; color: #fff; border-radius: 4px; cursor: pointer; font-size: 16px; }}
+        button:hover {{ background: #218838; }}
+        .error {{ color: #ff6b6b; margin-top: 10px; text-align: center; }}
     </style>
 </head>
 <body>
@@ -100,13 +102,14 @@ HTML_LOGIN = """
             <input type="password" name="password" placeholder="Введите пароль" required>
             <button type="submit">Войти</button>
         </form>
-        {error}
+        {error_block}
     </div>
 </body>
 </html>
 """
 
-HTML_DASHBOARD = """
+def get_dashboard_html(users_rows):
+    return f"""
 <!DOCTYPE html>
 <html>
 <head>
@@ -171,9 +174,9 @@ async def handle_root(request):
             """
         if not rows:
             rows = "<tr><td colspan='3'>Список пуст</td></tr>"
-        return web.Response(text=HTML_DASHBOARD.format(users_rows=rows), content_type="text/html")
+        return web.Response(text=get_dashboard_html(rows), content_type="text/html")
     
-    return web.Response(text=HTML_LOGIN.format(error=""), content_type="text/html")
+    return web.Response(text=get_login_html(), content_type="text/html")
 
 async def handle_login(request):
     data = await request.post()
@@ -181,7 +184,7 @@ async def handle_login(request):
         response = web.HTTPFound('/')
         response.set_cookie("auth", "true")
         return response
-    return web.Response(text=HTML_LOGIN.format(error="<div class='error'>Неверный пароль</div>"), content_type="text/html")
+    return web.Response(text=get_login_html("Неверный пароль"), content_type="text/html")
 
 async def handle_add(request):
     cookies = request.cookies
@@ -206,7 +209,6 @@ async def handle_delete(request):
 
 # --- ЗАПУСК ---
 async def main():
-    # Настройка веб-сервера
     app = web.Application()
     app.router.add_get('/', handle_root)
     app.router.add_post('/login', handle_login)
