@@ -5,6 +5,7 @@ import threading
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from google import genai
+from aiogram.types import BotCommand
 
 # --- Веб-заглушка для Render ---
 def run_dummy_server():
@@ -100,7 +101,17 @@ async def handle_message(message: types.Message):
     except Exception as e:
         await message.answer(f"Ошибка при запросе к ИИ: {e}")
 
+async def set_bot_commands(bot: Bot):
+    commands = [
+        BotCommand(command="reset", description="Сбросить диалог с ИИ"),
+        BotCommand(command="allow", description="[Admin] Добавить ID в белый список"),
+        BotCommand(command="deny", description="[Admin] Удалить ID из белого списка"),
+        BotCommand(command="whitelist", description="[Admin] Показать белый список"),
+    ]
+    await bot.set_my_commands(commands)
+
 async def main():
+    await set_bot_commands(bot) # <-- Устанавливаем подсказки
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
