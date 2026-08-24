@@ -1,97 +1,106 @@
-import os
 import asyncio
-import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import CommandStart, Command
+import os
+import http.server
+import threading
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
 from google import genai
-from dotenv import load_dotenv
 
-# Загружаем ключи из скрытого файла .env
-load_dotenv()
+# --- Веб-заглушка для Render ---
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = http.server.HTTPServer(("0.0.0.0", port), http.server.SimpleHTTPRequestHandler)
+    server.serve_forever()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MY_TELEGRAM_ID = int(os.getenv("MY_TELEGRAM_ID", 0))
+threading.Thread(target=run_dummy_server, daemon=True).start()
 
-# Проверка, что ключи на месте
-if not BOT_TOKEN or not GEMINI_API_KEY or not MY_TELEGRAM_ID:
-    print("❌ Ошибка: Проверь файл .env! Не найдены BOT_TOKEN, GEMINI_API_KEY или MY_TELEGRAM_ID.")
-    exit(1)
+# --- Конфигурация ---
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+ADMIN_ID = int(os.environ.get("MY_TELEGRAM_ID", 0))
 
-# Настройка логов
-logging.basicConfig(level=logging.INFO)
-
-# Инициализация бота и клиента Gemini
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Создаем чат с историей (памятью) для Gemini
-ai_chat = ai_client.chats.create(model="gemini-3.6-flash")
+# Хранилище: белый список (set) и личные сессии Gemini (dict)
+allowed_users = {ADMIN_ID}
+user_sessions = {}
 
-# Глобальный статус (по умолчанию - Обычный)
-USER_STATUS = "default"
+def get_user_chat(user_id: int):
+    """Возвращает или создает отдельный чат Gemini для каждого пользователя."""
+    if user_id not in user_sessions:
+        user_sessions[user_id] = ai_client.chats.create(model="gemini-3.6-flash")
+    return user_sessions[user_id]
 
-# --- Проверка прав (Белый список) ---
-def is_admin(user_id: int) -> bool:
-    return user_id == MY_TELEGRAM_ID
-
-
-# --- Обработчик команды /start ---
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return  # Игнорируем посторонних
-
-    await message.answer(
-        "👋 **ИИ-Ассистент запущен и помнит контекст!**\n\n"
-        f"Текущий статус: `{USER_STATUS}`\n"
-        "Пиши сюда — я на связи."
-    )
-
-
-# --- Обработчик команды /status ---
-@dp.message(Command(commands=["status"]))
-async def cmd_status(message: types.Message):
-    if not is_admin(message.from_user.id):
+# --- Админ-команды управления белым списком ---
+@dp.message(Command("allow"))
+async def allow_user(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    args = message.text.split()
+    if len(args) < 2 or not args[1].isdigit():
+        await message.answer("Использование: `/allow <telegram_id>`", parse_mode="Markdown")
         return
 
-    global USER_STATUS
-    args = message.text.split(maxsplit=1)
+    target_id = int(args[1])
+    allowed_users.add(target_id)
+    await message.answer(f"Пользователь `{target_id}` добавлен в белый список.", parse_mode="Markdown")
 
-    if len(args) > 1:
-        new_status = args[1].lower()
-        if new_status in ["default", "ignore", "sleep", "busy", "briefing"]:
-            USER_STATUS = new_status
-            await message.answer(f"✅ Статус успешно изменён на: `{USER_STATUS}`")
-        else:
-            await message.answer("❌ Неизвестный статус. Доступные: `default`, `ignore`, `sleep`, `busy`, `briefing`")
-    else:
-        await message.answer(f"Текущий статус: `{USER_STATUS}`")
+@dp.message(Command("deny"))
+async def deny_user(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
 
+    args = message.text.split()
+    if len(args) < 2 or not args[1].isdigit():
+        await message.answer("Использование: `/deny <telegram_id>`", parse_mode="Markdown")
+        return
 
-# --- Основной обработчик сообщений с памятью ---
-@dp.message()
+    target_id = int(args[1])
+    if target_id == ADMIN_ID:
+        await message.answer("Нельзя удалить себя из белого списка!")
+        return
+
+    allowed_users.discard(target_id)
+    user_sessions.pop(target_id, None)
+    await message.answer(f"Пользователь `{target_id}` удален из белого списка.", parse_mode="Markdown")
+
+@dp.message(Command("whitelist"))
+async def show_whitelist(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    users_list = "\n".join([f"• `{uid}`" for uid in allowed_users])
+    await message.answer(f"**Белый список:**\n{users_list}", parse_mode="Markdown")
+
+@dp.message(Command("reset"))
+async def reset_context(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in allowed_users:
+        return
+    
+    user_sessions.pop(user_id, None)
+    await message.answer("Твой контекст общения с ИИ сброшен.")
+
+# --- Обработка обычных сообщений ---
+@dp.message(F.text)
 async def handle_message(message: types.Message):
-    if not is_admin(message.from_user.id):
+    user_id = message.from_user.id
+    
+    if user_id not in allowed_users:
+        await message.answer("У вас нет доступа к этому боту.")
         return
-
-    # Отправляем в Telegram статус "печатает..."
-    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
     try:
-        # Метод send_message автоматически сохраняет предыдущий контекст диалога
-        response = ai_chat.send_message(message.text)
-        await message.answer(response.text, parse_mode="Markdown")
-
+        user_chat = get_user_chat(user_id)
+        response = user_chat.send_message(message.text)
+        await message.answer(response.text)
     except Exception as e:
-        print(f"Ошибка: {e}")
-        await message.answer("Произошла ошибка при обращении к ИИ.")
+        await message.answer(f"Ошибка при запросе к ИИ: {e}")
 
-
-# --- Точка входа ---
 async def main():
-    print("Бот запущен с памятью!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
